@@ -1,29 +1,40 @@
 import DOCS from './help.html'
 
+// 定义常量
+const DOCKER_HUB = "https://registry-1.docker.io";
+const QUAY = "https://quay.io";
+const GCR = "https://gcr.io";
+const K8S_GCR = "https://k8s.gcr.io";
+const K8S = "https://registry.k8s.io";
+const GHCR = "https://ghcr.io";
+const CLOUDSMITH = "https://docker.cloudsmith.io";
+
+// 定义路由
+const ROUTES = {
+  // production
+  "docker.imixc.top": DOCKER_HUB,
+  "quay.imixc.top": QUAY,
+  "gcr.imixc.top": GCR,
+  "k8s-gcr.imixc.top": K8S_GCR,
+  "k8s.imixc.top": K8S,
+  "ghcr.imixc.top": GHCR,
+  "cloudsmith.imixc.top": CLOUDSMITH,
+
+  // staging
+  "docker-staging.imixc.top": DOCKER_HUB,
+};
+
+let MODE = "production"; // 假设默认模式为 production
+const TARGET_UPSTREAM = DOCKER_HUB; // 假设默认上游为 DOCKER_HUB
+
 addEventListener("fetch", (event) => {
   event.passThroughOnException();
   event.respondWith(handleRequest(event.request));
 });
 
-const dockerHub = "https://registry-1.docker.io";
-
-const routes = {
-  // production
-  "docker.imixc.top": dockerHub,
-  "quay.imixc.top": "https://quay.io",
-  "gcr.imixc.top": "https://gcr.io",
-  "k8s-gcr.imixc.top": "https://k8s.gcr.io",
-  "k8s.imixc.top": "https://registry.k8s.io",
-  "ghcr.imixc.top": "https://ghcr.io",
-  "cloudsmith.imixc.top": "https://docker.cloudsmith.io",
-
-  // staging
-  "docker-staging.imixc.top": dockerHub,
-};
-
 function routeByHosts(host) {
-  if (host in routes) {
-    return routes[host];
+  if (host in ROUTES) {
+    return ROUTES[host];
   }
   if (MODE == "debug") {
     return TARGET_UPSTREAM;
@@ -37,7 +48,7 @@ async function handleRequest(request) {
   if (upstream === "") {
     return new Response(
       JSON.stringify({
-        routes: routes,
+        routes: ROUTES,
       }),
       {
         status: 404,
@@ -53,7 +64,7 @@ async function handleRequest(request) {
       }
     });
   }
-  const isDockerHub = upstream == dockerHub;
+  const isDockerHub = upstream == DOCKER_HUB;
   const authorization = request.headers.get("Authorization");
   if (url.pathname == "/v2/") {
     const newUrl = new URL(upstream + "/v2/");
@@ -62,57 +73,69 @@ async function handleRequest(request) {
       headers.set("Authorization", authorization);
     }
     // check if need to authenticate
-    const resp = await fetch(newUrl.toString(), {
-      method: "GET",
-      headers: headers,
-      redirect: "follow",
-    });
-    if (resp.status === 401) {
-      if (MODE == "debug") {
-        headers.set(
-          "Www-Authenticate",
-          `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
-        );
-      } else {
-        headers.set(
-          "Www-Authenticate",
-          `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
-        );
-      }
-      return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
-        status: 401,
+    try {
+      const resp = await fetch(newUrl.toString(), {
+        method: "GET",
         headers: headers,
+        redirect: "follow",
       });
-    } else {
-      return resp;
+      if (resp.status === 401) {
+        if (MODE == "debug") {
+          headers.set(
+            "Www-Authenticate",
+            `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
+          );
+        } else {
+          headers.set(
+            "Www-Authenticate",
+            `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
+          );
+        }
+        return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
+          status: 401,
+          headers: headers,
+        });
+      } else {
+        return resp;
+      }
+    } catch (error) {
+      return new Response(JSON.stringify({ message: "Internal Server Error" }), {
+        status: 500,
+      });
     }
   }
   // get token
   if (url.pathname == "/v2/auth") {
     const newUrl = new URL(upstream + "/v2/");
-    const resp = await fetch(newUrl.toString(), {
-      method: "GET",
-      redirect: "follow",
-    });
-    if (resp.status !== 401) {
-      return resp;
-    }
-    const authenticateStr = resp.headers.get("WWW-Authenticate");
-    if (authenticateStr === null) {
-      return resp;
-    }
-    const wwwAuthenticate = parseAuthenticate(authenticateStr);
-    let scope = url.searchParams.get("scope");
-    // autocomplete repo part into scope for DockerHub library images
-    // Example: repository:busybox:pull => repository:library/busybox:pull
-    if (scope && isDockerHub) {
-      let scopeParts = scope.split(":");
-      if (scopeParts.length == 3 && !scopeParts[1].includes("/")) {
-        scopeParts[1] = "library/" + scopeParts[1];
-        scope = scopeParts.join(":");
+    try {
+      const resp = await fetch(newUrl.toString(), {
+        method: "GET",
+        redirect: "follow",
+      });
+      if (resp.status !== 401) {
+        return resp;
       }
+      const authenticateStr = resp.headers.get("WWW-Authenticate");
+      if (authenticateStr === null) {
+        return resp;
+      }
+      const wwwAuthenticate = parseAuthenticate(authenticateStr);
+      let scope = url.searchParams.get("scope");
+      // autocomplete repo part into scope for DockerHub library images
+      // Example: repository:busybox:pull => repository:library/busybox:pull
+      if (scope && isDockerHub) {
+        let scopeParts = scope.split(":");
+        if (scopeParts.length == 3 && !scopeParts[1].includes("/")) {
+          scopeParts[1] = "library/" + scopeParts[1];
+          scope = scopeParts.join(":");
+        }
+      }
+      return await fetchToken(wwwAuthenticate, scope, authorization);
+    } catch (error) {
+      return new Response(JSON.stringify({ message: "Internal Server Error" }), {
+        status: 500,
+      });
     }
-    return await fetchToken(wwwAuthenticate, scope, authorization);
   }
   // redirect for DockerHub library images
   // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
@@ -122,17 +145,23 @@ async function handleRequest(request) {
       pathParts.splice(2, 0, "library");
       const redirectUrl = new URL(url);
       redirectUrl.pathname = pathParts.join("/");
-      return Response.redirect(redirectUrl, 301);
+      return Response.redirect(redirectUrl.toString(), 301);
     }
   }
-  // foward requests
+  // forward requests
   const newUrl = new URL(upstream + url.pathname);
   const newReq = new Request(newUrl, {
     method: request.method,
     headers: request.headers,
     redirect: "follow",
   });
-  return await fetch(newReq);
+  try {
+    return await fetch(newReq);
+  } catch (error) {
+    return new Response(JSON.stringify({ message: "Internal Server Error" }), {
+      status: 500,
+    });
+  }
 }
 
 function parseAuthenticate(authenticateStr) {
@@ -151,15 +180,21 @@ function parseAuthenticate(authenticateStr) {
 
 async function fetchToken(wwwAuthenticate, scope, authorization) {
   const url = new URL(wwwAuthenticate.realm);
-  if (wwwAuthenticate.service.length) {
+  if (wwwAuthenticate.service.length && !url.searchParams.has("service")) {
     url.searchParams.set("service", wwwAuthenticate.service);
   }
-  if (scope) {
+  if (scope && !url.searchParams.has("scope")) {
     url.searchParams.set("scope", scope);
   }
-  headers = new Headers();
+  const headers = new Headers(); // 修复：headers 变量未定义
   if (authorization) {
     headers.set("Authorization", authorization);
   }
-  return await fetch(url, { method: "GET", headers: headers });
+  try {
+    return await fetch(url, { method: "GET", headers: headers });
+  } catch (error) {
+    return new Response(JSON.stringify({ message: "Internal Server Error" }), {
+      status: 500,
+    });
+  }
 }
